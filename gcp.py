@@ -325,7 +325,7 @@ def reroll_cpu_loop(project_id, instance_info):
 
             if (i + 1) % 5 == 0:
                 print_info(f"正在等待 CPU 元数据同步... ({i+1}/{max_retries}) - 机器正在启动中")
-            time.sleep(2)
+            time.sleep(5)
 
         if current_platform == "Unknown CPU Platform":
             print_warning("超时：等待 2 分钟后仍无法获取 CPU 信息。")
@@ -342,7 +342,7 @@ def reroll_cpu_loop(project_id, instance_info):
         op = instance_client.stop(project=project_id, zone=zone, instance=instance_name)
         wait_for_operation(project_id, zone, op.name)
         attempt_counter += 1
-        time.sleep(2)
+        time.sleep(5)
 
 
 def read_cdn_ips(filename="cdnip.txt"):
@@ -406,13 +406,12 @@ def add_allow_all_ingress(project_id, network):
             traceback.print_exc()
 
 
-def add_deny_cdn_egress(project_id, ip_ranges, network):
+def add_deny_cdn_egress(project_id, ip_ranges, network, rule_name="deny-cdn-egress-custom"):
     if not ip_ranges:
         print("IP 列表为空，跳过创建拒绝规则。")
         return
 
     firewall_client = compute_v1.FirewallsClient()
-    rule_name = "deny-cdn-egress-custom"
 
     print(f"\n正在创建出站拒绝规则: {rule_name} ...")
 
@@ -458,11 +457,14 @@ def configure_firewall(project_id, network):
         ips = read_cdn_ips()
         if ips:
             if len(ips) > 256:
-                print(f"【警告】IP 数量 ({len(ips)}) 超过 GCP 单条规则上限 (256)。")
-                print("脚本将只取前 256 个 IP。")
-                ips = ips[:256]
-
-            add_deny_cdn_egress(project_id, ips, network)
+                print(f"【提示】IP 数量 ({len(ips)}) 超过 GCP 单条规则上限 (256)。")
+                print("脚本将自动拆分并创建多条防火墙规则。")
+                for i in range(0, len(ips), 256):
+                    chunk = ips[i:i+256]
+                    rule_name = f"deny-cdn-egress-custom-{i//256 + 1}"
+                    add_deny_cdn_egress(project_id, chunk, network, rule_name)
+            else:
+                add_deny_cdn_egress(project_id, ips, network)
     else:
         print("已跳过出站规则配置。")
 
@@ -517,7 +519,7 @@ def delete_free_resources(project_id, instance_info):
     print("即将删除以下资源（可以重新创建免费资源）：")
     print(f"- 实例: {instance_name} ({zone})")
     print(f"- 相关磁盘（如仍存在）")
-    print(f"- 防火墙规则: {', '.join(FIREWALL_RULES_TO_CLEAN)}")
+    print("- 防火墙规则: allow-all-ingress-custom, deny-cdn-egress-custom*")
     confirm = input("请输入 DELETE 确认删除: ").strip()
     if confirm != "DELETE":
         print("已取消删除操作。")
@@ -548,8 +550,13 @@ def delete_free_resources(project_id, instance_info):
     delete_disks_if_needed(project_id, zone, disk_names)
 
     print_info("正在清理防火墙规则...")
-    for rule_name in FIREWALL_RULES_TO_CLEAN:
-        delete_firewall_rule(project_id, rule_name)
+    firewall_client = compute_v1.FirewallsClient()
+    try:
+        for rule in firewall_client.list(project=project_id):
+            if rule.name == "allow-all-ingress-custom" or rule.name.startswith("deny-cdn-egress-custom"):
+                delete_firewall_rule(project_id, rule.name)
+    except Exception as e:
+        print_warning(f"列出防火墙规则失败: {e}")
 
     print_success("清理完成。建议到控制台确认无残留资源。")
     return True
